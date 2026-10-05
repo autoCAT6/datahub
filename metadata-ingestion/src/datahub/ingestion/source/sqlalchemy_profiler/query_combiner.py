@@ -408,6 +408,8 @@ class SQLAlchemyQueryCombiner:
     flatten_enabled: bool = False
     # See DEFAULT_MAX_DISTINCT_PER_STATEMENT.
     max_distinct_per_statement: int = DEFAULT_MAX_DISTINCT_PER_STATEMENT
+    # See MAX_QUERIES_TO_COMBINE_AT_ONCE.
+    max_queries_to_combine: int = MAX_QUERIES_TO_COMBINE_AT_ONCE
 
     # The Python GIL ensures that modifications to the report's counters
     # are safe.
@@ -660,7 +662,7 @@ class SQLAlchemyQueryCombiner:
         pending_queue = dict(
             itertools.islice(
                 sorted(pending_queue.items(), key=lambda kv: not kv[1].is_gate),
-                MAX_QUERIES_TO_COMBINE_AT_ONCE,
+                self.max_queries_to_combine,
             )
         )
 
