@@ -8,6 +8,8 @@ import static com.linkedin.metadata.utils.CriterionUtils.buildCriterion;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.common.urn.UrnUtils;
 import com.linkedin.data.DataMap;
@@ -27,29 +29,30 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * Structured properties Search V3 full-text reads, resolved from metadata projected onto active
- * structured-property search documents. The result is cached per search retriever and dropped when
- * a structured-property document changes.
+ * structured-property search documents. The result is cached per search retriever.
  */
 @Slf4j
 public final class V3StructuredPropertySearchCatalog {
 
   private static final int PAGE_SIZE = 500;
-  private static final ConcurrentHashMap<SearchRetriever, List<IndexedProperty>> CACHE =
-      new ConcurrentHashMap<>();
+  // Match cache.client.entityClient.entityAspectTTLSeconds.structuredProperty.propertyDefinition.
+  // Search writes are asynchronous and GMS pods do not share invalidation signals, so expiry is the
+  // consistency boundary rather than event-driven invalidation.
+  private static final int CACHE_TTL_SECONDS = 300;
+  private static final Cache<SearchRetriever, List<IndexedProperty>> CACHE =
+      CacheBuilder.newBuilder()
+          .maximumSize(100)
+          .expireAfterWrite(CACHE_TTL_SECONDS, TimeUnit.SECONDS)
+          .build();
 
   private V3StructuredPropertySearchCatalog() {}
-
-  /** Drops every cached listing. A structured-property definition change calls this. */
-  public static void invalidate() {
-    CACHE.clear();
-  }
 
   /**
    * Opted-in properties that apply to at least one of {@code entitySpecs}. A property mapped on
@@ -66,7 +69,7 @@ public final class V3StructuredPropertySearchCatalog {
     }
     SearchRetriever searchRetriever = opContext.getRetrieverContext().getSearchRetriever();
     List<IndexedProperty> all =
-        CACHE.computeIfAbsent(searchRetriever, ignored -> load(opContext, searchRetriever));
+        CACHE.asMap().computeIfAbsent(searchRetriever, ignored -> load(opContext, searchRetriever));
     return all.stream().filter(property -> property.appliesTo(entitySpecs)).toList();
   }
 

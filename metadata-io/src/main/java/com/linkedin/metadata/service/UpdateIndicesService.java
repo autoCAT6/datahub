@@ -16,7 +16,6 @@ import com.linkedin.metadata.entity.ebean.batch.MCLItemImpl;
 import com.linkedin.metadata.models.AspectSpec;
 import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.search.elasticsearch.ElasticSearchService;
-import com.linkedin.metadata.search.elasticsearch.query.request.V3StructuredPropertySearchCatalog;
 import com.linkedin.metadata.search.elasticsearch.update.BulkTransferException;
 import com.linkedin.metadata.search.elasticsearch.update.ESBulkProcessor;
 import com.linkedin.metadata.search.elasticsearch.update.ESWriteDAO;
@@ -115,10 +114,6 @@ public class UpdateIndicesService implements SearchIndicesService {
       if (strategy.isEnabled()) {
         strategy.processBatch(opContext, groupedEvents, structuredPropertiesHookEnabled);
       }
-    }
-    if (groupedEvents.keySet().stream()
-        .anyMatch(urn -> STRUCTURED_PROPERTY_ENTITY_NAME.equals(urn.getEntityType()))) {
-      V3StructuredPropertySearchCatalog.invalidate();
     }
 
     // Record throttle writes after all strategies have processed, so no strategy's

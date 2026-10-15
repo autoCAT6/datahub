@@ -47,7 +47,6 @@ public class V3StructuredPropertySearchCatalogTest {
 
   @BeforeMethod
   public void setUp() {
-    V3StructuredPropertySearchCatalog.invalidate();
     searchRetriever = mock(SearchRetriever.class);
     opContext = mock(OperationContext.class);
     RetrieverContext retrieverContext = mock(RetrieverContext.class);
@@ -107,6 +106,10 @@ public class V3StructuredPropertySearchCatalogTest {
     assertEquals(properties.size(), 1);
     assertEquals(properties.get(0).fieldPath(), "structuredProperties.hiddenLabel");
     assertFalse(properties.get(0).queryByDefault());
+    assertEquals(
+        V3StructuredPropertySearchCatalog.indexed(
+            opContext, List.of(entityRegistry.getEntitySpec(DATASET_ENTITY_NAME))),
+        properties);
 
     ArgumentCaptor<List<String>> entities = ArgumentCaptor.forClass(List.class);
     ArgumentCaptor<Filter> filter = ArgumentCaptor.forClass(Filter.class);
