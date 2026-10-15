@@ -267,6 +267,9 @@ class ProfilingConfig(ProfilingBaseConfig):
         Optional[pydantic.PositiveInt], SupportedSources(["mysql", "postgres"])
     ] = Field(
         default=None,
+        # Both servers take the limit in milliseconds as a signed 32-bit int, so
+        # a larger value is rejected by the SET itself.
+        le=2147483,
         description=(
             "Server-side time limit for each profiling statement, in seconds. "
             "Defaults to unset, so a statement runs as long as it takes. A single "
@@ -282,7 +285,13 @@ class ProfilingConfig(ProfilingBaseConfig):
             "the slow ones lose their metrics. A table is left without field "
             "profiles only when the row count itself times out. One whose columns "
             "are each slow enough to time out therefore costs roughly this limit "
-            "per profiling query, which on a wide table is many multiples of it."
+            "per profiling query, which on a wide table is many multiples of it. "
+            "Pair it with `profiling_isolation_level: AUTOCOMMIT`. Under a "
+            "transactional isolation level a timed-out statement leaves the "
+            "transaction aborted on Postgres, so the table loses the per-column "
+            "metrics that run after it, and on MySQL REPEATABLE READ the read "
+            "view is held from the first statement to the commit, so a "
+            "per-statement limit does not bound it."
         ),
     )
 

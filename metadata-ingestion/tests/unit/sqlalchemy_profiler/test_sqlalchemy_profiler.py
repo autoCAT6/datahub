@@ -1,5 +1,6 @@
 """Unit tests for SQLAlchemyProfiler."""
 
+import contextlib
 import logging
 import sqlite3
 from datetime import date, datetime
@@ -187,49 +188,61 @@ class TestQueryTimeout:
     def _timeout(read="SHOW t", apply="SET t = 1", restore="SET t = {value}"):
         return QueryTimeout(read=read, apply=apply, restore=restore)
 
-    def test_unset_timeout_touches_nothing(self, profiler):
+    @staticmethod
+    def _conn(autocommit=True, isolation_level="READ COMMITTED"):
         conn = MagicMock()
-        assert (
-            profiler._apply_query_timeout(conn, self._adapter(self._timeout()), "t")
-            is None
-        )
-        conn.execute.assert_not_called()
+        conn.get_execution_options.return_value = {}
+        # The driver flag is what the profiler reads: get_isolation_level()
+        # reports the server's level and never says AUTOCOMMIT.
+        conn.connection.dbapi_connection.autocommit = autocommit
+        conn.get_isolation_level.return_value = isolation_level
+        return conn
+
+    def _install(self, profiler, conn, adapter, stack=None):
+        """Runs the install and then the cleanup the ExitStack collected."""
+        with stack or contextlib.ExitStack() as st:
+            profiler._install_query_timeout(st, conn, adapter, "t")
+
+    def test_unset_timeout_touches_nothing(self, profiler):
+        conn = self._conn()
+        self._install(profiler, conn, self._adapter(self._timeout()))
+        conn.exec_driver_sql.assert_not_called()
 
     def test_unsupported_platform_is_ignored(self, profiler):
         profiler.config.query_timeout_seconds = 30
-        conn = MagicMock()
-        assert profiler._apply_query_timeout(conn, self._adapter(None), "t") is None
-        conn.execute.assert_not_called()
+        conn = self._conn()
+        self._install(profiler, conn, self._adapter(None))
+        conn.exec_driver_sql.assert_not_called()
 
-    def test_applied_limit_is_committed(self, profiler):
+    def test_applied_limit_is_committed_then_restored(self, profiler):
         # Postgres rolls a plain SET back with its transaction, and the serial
         # fallback rolls back before every retry.
         profiler.config.query_timeout_seconds = 30
-        conn = MagicMock()
-        conn.execute.return_value.scalar.return_value = 5000
-        clear = profiler._apply_query_timeout(
-            conn, self._adapter(self._timeout(apply="SET x = 1")), "t"
-        )
-        # The prior value is put back, not the server default.
-        assert clear == "SET t = 5000"
-        # Read, then set, then commit -- in that order.
-        assert [c[0] for c in conn.mock_calls if c[0] in ("execute", "commit")] == [
-            "execute",
-            "execute",
-            "commit",
-        ]
-        assert str(conn.execute.call_args[0][0]) == "SET x = 1"
+        conn = self._conn()
+        conn.exec_driver_sql.return_value.scalar.return_value = 5000
+        self._install(profiler, conn, self._adapter(self._timeout(apply="SET x = 1")))
+        issued = [c.args[0] for c in conn.exec_driver_sql.call_args_list]
+        # Read, set, then -- once the stack unwinds -- put the prior value back,
+        # not the server default.
+        assert issued == ["SHOW t", "SET x = 1", "SET t = 5000"]
 
-    def test_failure_to_apply_warns_and_continues(self, profiler):
+    def test_session_bookkeeping_bypasses_the_combiner(self, profiler):
+        # Connection.execute is what the combiner patches and counts; these
+        # statements are not profiling queries and must not land in the report.
         profiler.config.query_timeout_seconds = 30
-        conn = MagicMock()
-        conn.execute.side_effect = sqlite3.OperationalError("nope")
-        assert (
-            profiler._apply_query_timeout(
-                conn, self._adapter(self._timeout(apply="SET x = 1")), "t"
-            )
-            is None
-        )
+        conn = self._conn()
+        conn.exec_driver_sql.return_value.scalar.return_value = 5000
+        self._install(profiler, conn, self._adapter(self._timeout()))
+        conn.execute.assert_not_called()
+
+    def test_failure_to_apply_rolls_back_and_warns(self, profiler):
+        # A rejected SET leaves Postgres in an aborted transaction, which would
+        # otherwise cost the table every query that follows.
+        profiler.config.query_timeout_seconds = 30
+        conn = self._conn()
+        conn.exec_driver_sql.side_effect = sqlite3.OperationalError("nope")
+        self._install(profiler, conn, self._adapter(self._timeout(apply="SET x = 1")))
+        conn.rollback.assert_called_once()
         assert profiler.report.warning.call_args.kwargs["title"] == (
             "Profiling: query timeout unavailable"
         )
@@ -237,28 +250,67 @@ class TestQueryTimeout:
     def test_failure_to_apply_raises_when_not_catching(self, profiler):
         profiler.config.query_timeout_seconds = 30
         profiler.config.catch_exceptions = False
-        conn = MagicMock()
-        conn.execute.side_effect = sqlite3.OperationalError("nope")
+        conn = self._conn()
+        conn.exec_driver_sql.side_effect = sqlite3.OperationalError("nope")
         with pytest.raises(sqlite3.OperationalError):
-            profiler._apply_query_timeout(
-                conn, self._adapter(self._timeout(apply="SET x = 1")), "t"
+            self._install(
+                profiler, conn, self._adapter(self._timeout(apply="SET x = 1"))
             )
 
-    def test_clear_rolls_back_first(self, profiler):
-        # The table's last query may have left the transaction aborted.
+    def test_a_failed_commit_still_clears_the_limit(self, profiler):
+        # SET SESSION is not transactional on MySQL, so the limit is on the
+        # connection whether or not the commit succeeded, and the connection
+        # goes back to a pool metadata extraction shares.
+        profiler.config.query_timeout_seconds = 30
+        conn = self._conn()
+        conn.exec_driver_sql.return_value.scalar.return_value = 5000
+        conn.commit.side_effect = sqlite3.OperationalError("no commit")
+        self._install(profiler, conn, self._adapter(self._timeout()))
+        assert "SET t = 5000" in [
+            c.args[0] for c in conn.exec_driver_sql.call_args_list
+        ]
+
+    def test_clear_rolls_back_before_restoring(self, profiler):
+        # The table's last query may have left the transaction aborted, so the
+        # order matters, not just that both happened.
         conn = MagicMock()
         profiler._clear_query_timeout(conn, "SET x = DEFAULT")
-        conn.rollback.assert_called_once()
-        assert str(conn.execute.call_args[0][0]) == "SET x = DEFAULT"
-        conn.commit.assert_called_once()
+        assert [
+            c[0]
+            for c in conn.mock_calls
+            if c[0] in ("rollback", "exec_driver_sql", "commit")
+        ] == ["rollback", "exec_driver_sql", "commit"]
 
     def test_failed_clear_never_raises_and_drops_the_connection(self, profiler):
         # The profile is already built; cleanup must not be able to discard it,
         # and a connection that may still carry the limit must not be pooled.
         conn = MagicMock()
-        conn.execute.side_effect = sqlite3.OperationalError("in failed transaction")
+        conn.exec_driver_sql.side_effect = sqlite3.OperationalError(
+            "in failed transaction"
+        )
         profiler._clear_query_timeout(conn, "SET x = DEFAULT")
         conn.invalidate.assert_called_once()
+
+    def test_a_transactional_connection_is_warned_about(self, profiler):
+        # The limit only contains the damage under AUTOCOMMIT: elsewhere a
+        # timed-out statement aborts the transaction and the per-column queries
+        # that follow all fail.
+        profiler.config.query_timeout_seconds = 30
+        conn = self._conn(autocommit=False, isolation_level="REPEATABLE READ")
+        conn.exec_driver_sql.return_value.scalar.return_value = 5000
+        self._install(profiler, conn, self._adapter(self._timeout()))
+        assert profiler.report.warning.call_args_list[0].kwargs["title"] == (
+            "Profiling: query timeout set on a transactional connection"
+        )
+
+    def test_autocommit_is_not_warned_about(self, profiler):
+        # No execution option says so -- an engine built with
+        # isolation_level=AUTOCOMMIT, which is how the Postgres source connects.
+        profiler.config.query_timeout_seconds = 30
+        conn = self._conn()
+        conn.exec_driver_sql.return_value.scalar.return_value = 5000
+        self._install(profiler, conn, self._adapter(self._timeout()))
+        profiler.report.warning.assert_not_called()
 
 
 class TestSQLAlchemyProfiler:
@@ -1470,6 +1522,57 @@ class TestIgnoreSamplingColumnNames:
             == []
         )
         adapter.field_path_for.assert_not_called()
+
+
+class TestJoinLimitWarning:
+    """A batch above the dialect's join limit is slower than not combining."""
+
+    @staticmethod
+    def _profiler(platform, report, **overrides):
+        return SQLAlchemyProfiler(
+            conn=MagicMock(),
+            report=report,
+            config=ProfilingConfig(
+                enabled=True, query_combiner_enabled=True, **overrides
+            ),
+            platform=platform,
+            env="TEST",
+        )
+
+    @pytest.mark.parametrize(
+        "platform,cap,warned",
+        [
+            ("sqlite", 65, True),
+            ("sqlite", 64, False),
+            ("mysql", 62, True),
+            ("mysql", 61, False),
+            # Not in the table: no limit is assumed rather than guessed.
+            ("postgres", 500, False),
+        ],
+    )
+    def test_warns_only_above_a_known_limit(self, platform, cap, warned):
+        report = MagicMock()
+        self._profiler(platform, report, max_queries_to_combine=cap)
+        titles = [c.kwargs.get("title") for c in report.warning.call_args_list]
+        assert (
+            "Profiling: max_queries_to_combine above the join limit" in titles
+        ) is warned
+
+    def test_silent_when_the_combiner_is_off(self):
+        # Nothing is merged, so nothing can exceed the limit.
+        report = MagicMock()
+        SQLAlchemyProfiler(
+            conn=MagicMock(),
+            report=report,
+            config=ProfilingConfig(
+                enabled=True,
+                query_combiner_enabled=False,
+                max_queries_to_combine=500,
+            ),
+            platform="sqlite",
+            env="TEST",
+        )
+        report.warning.assert_not_called()
 
 
 class TestQueryCombinerWiring:

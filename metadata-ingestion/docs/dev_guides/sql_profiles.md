@@ -76,13 +76,20 @@ Only single-aggregate-over-a-whole-table queries are flattened. Anything the pro
 
 `max_distinct_per_statement` (default 5) caps how many `COUNT(DISTINCT)` columns share one statement. The default is a starting point rather than a measured optimum.
 
-`max_queries_to_combine` (default 40) caps how many **queries** share one statement — not columns. A 12-column table of numeric columns queues around 70 queries, because each column contributes several; a table of strings queues far fewer. Raising it cuts round trips, and with flattening on it also cuts scans, because a flattened statement is one aggregate list over one table. With flattening off each merged query is still its own aggregate, so only round trips fall.
+`max_queries_to_combine` (default 40) caps how many **queries** share one statement — not columns. A 12-column numeric table queues 109 queries under default settings, because each column contributes several and an unsampled median adds more; a table of strings queues far fewer. Raising it cuts round trips, and with flattening on it also cuts scans, because a flattened statement is one aggregate list over one table. With flattening off each merged query is still its own aggregate, so only round trips fall.
 
-The database bounds how far it can usefully be raised: a merged statement cross-joins one subquery per query, and MySQL allows 61 tables in a join, SQLite 64. Past that every merged statement fails and is retried one query at a time — on a 20-column SQLite table, a value of 100 turned 4 statements into 83.
+The database bounds how far it can usefully be raised: a merged statement cross-joins one subquery per query, and MySQL allows 61 tables in a join, SQLite 64. Past that every merged statement fails and is retried one query at a time. A value above the limit is therefore slower than not combining at all; the profiler warns at startup when it can tell, which it can for MySQL, MariaDB and SQLite.
 
-A flattened statement does not join, so its normal path is not subject to that limit. Its recovery is: a flat statement that fails is re-routed through the joining path, so above the limit that recovery skips straight to one query at a time. Measured on the same table with the flat form failing, a value of 40 recovered in 5 statements and 100 took 84.
+A flattened statement does not join, so its normal path is not subject to that limit. Its recovery is: a flat statement that fails is re-routed through the joining path, so above the limit that recovery skips straight to one query at a time.
 
-The other trade is that a statement which fails is retried one query at a time, so a bigger batch means a bigger retry.
+The other trade is that a statement which fails is retried one query at a time, and that retry is scoped to the batch that failed — so a bigger batch means a bigger retry.
+
+Measured on a 20-column numeric SQLite table (101 queued queries, with sample values, median and stddev off):
+
+| `max_queries_to_combine` | flattening off | flattening on, flat form rejected |
+| ------------------------ | -------------- | --------------------------------- |
+| 40                       | 3 statements   | 6 statements                      |
+| 100 (above SQLite's 64)  | 102 statements | 83 statements                     |
 
 ### Bounding how long one statement runs
 
@@ -90,9 +97,16 @@ Combining and flattening reduce how many statements run, but not how long one of
 
 `profiling.query_timeout_seconds` puts a server-side limit on each profiling statement (`max_execution_time` on MySQL, `statement_timeout` on Postgres; only these two are implemented, and other platforms ignore the option). The limit is set on the profiling connection and the session's previous value put back when the table is done, so it neither leaks to the connection pool that metadata extraction shares nor discards a limit the session already carried.
 
-A statement that exceeds the limit does not cost the whole table. It is retried one query at a time, so columns whose own query then succeeds are still profiled and only the slow ones lose their metrics; a table is left without field profiles only when the row count itself times out.
+**Pair it with `profiling_isolation_level: AUTOCOMMIT`.** The limit only contains the damage under autocommit, and the profiler warns when it is set on a transactional connection:
+
+- On Postgres a timed-out statement leaves the transaction aborted. The combiner rolls back before each of its own retries, but the per-column queries that follow — quantiles, histograms, value frequencies, sample values — do not, so the whole table loses them. Under AUTOCOMMIT only the slow column loses its metrics.
+- On MySQL the default `REPEATABLE READ` holds the read view from the first statement until the commit, so a per-statement limit does not bound the thing this option exists to bound. `AUTOCOMMIT` or `READ COMMITTED` restores the connection.
+
+Under AUTOCOMMIT, a statement that exceeds the limit does not cost the whole table. It is retried one query at a time, so columns whose own query then succeeds are still profiled and only the slow ones lose their metrics; a table is left without field profiles only when the row count itself times out.
 
 Size it with that retry in mind: a table whose columns are each slow enough to time out costs roughly the limit **per profiling query**, which on a wide table is many multiples of it.
+
+Behind a connection pooler in transaction mode (PgBouncer and similar) the limit is not reliable: the `SET` is committed in its own transaction and so is the restore, and each may land on a different server connection.
 
 #### Reading the report
 

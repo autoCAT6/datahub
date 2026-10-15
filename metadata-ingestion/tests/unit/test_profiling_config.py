@@ -129,6 +129,15 @@ def test_max_queries_to_combine_default_matches_combiner_constant() -> None:
     assert ProfilingConfig().max_queries_to_combine == MAX_QUERIES_TO_COMBINE_AT_ONCE
 
 
+def test_query_timeout_seconds_rejects_a_value_the_server_cannot_hold() -> None:
+    # Both servers take the limit as a signed 32-bit count of milliseconds, so
+    # a larger value is rejected by the SET -- which, on Postgres, left the
+    # transaction aborted and cost the table every query that followed.
+    with pytest.raises(ValueError):
+        ProfilingConfig(query_timeout_seconds=2147484)
+    assert ProfilingConfig(query_timeout_seconds=2147483)
+
+
 def test_flatten_is_off_by_default() -> None:
     # The flag ships off. Flipping the default is a separate, deliberate PR.
     assert ProfilingConfig().query_combiner_flatten_enabled is False
