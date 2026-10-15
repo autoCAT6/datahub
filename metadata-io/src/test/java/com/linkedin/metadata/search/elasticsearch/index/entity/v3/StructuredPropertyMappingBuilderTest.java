@@ -269,9 +269,7 @@ public class StructuredPropertyMappingBuilderTest {
                   .setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(false)));
       assertFalse(configured.containsKey("copy_to"), valueType);
       assertEquals(configured.get("type"), "keyword", valueType);
-      assertTrue(
-          analyzedSubfields(configured).containsAll(Set.of("text", "stemmed")),
-          configured.toString());
+      assertAnalyzedSubfields(configured, valueType);
       if (!"urn".equals(valueType)) {
         assertTrue(analyzedSubfields(configured).contains("keyword"), configured.toString());
       }
@@ -284,8 +282,7 @@ public class StructuredPropertyMappingBuilderTest {
                       new DataHubSearchConfig()
                           .setQueryByDefault(true)
                           .setExcludeFromFullTextSearch(true)));
-      assertTrue(
-          analyzedSubfields(excluded).containsAll(Set.of("text", "stemmed")), excluded.toString());
+      assertAnalyzedSubfields(excluded, valueType);
     }
     for (String valueType : List.of("number", "date")) {
       Map<String, Object> configured =
@@ -305,6 +302,20 @@ public class StructuredPropertyMappingBuilderTest {
     Set<String> names = new HashSet<>();
     fieldsMap.keySet().forEach(key -> names.add(String.valueOf(key)));
     return names;
+  }
+
+  private static void assertAnalyzedSubfields(Map<String, Object> mapping, String valueType) {
+    Map<String, Object> expected = V3SearchFields.analyzedSubfields();
+    assertEquals(subfield(mapping, "text"), expected.get("text"), valueType);
+    assertEquals(subfield(mapping, "stemmed"), expected.get("stemmed"), valueType);
+  }
+
+  private static Object subfield(Map<String, Object> mapping, String name) {
+    Object fields = mapping.get("fields");
+    if (!(fields instanceof Map<?, ?> fieldsMap)) {
+      return null;
+    }
+    return fieldsMap.get(name);
   }
 
   @Test

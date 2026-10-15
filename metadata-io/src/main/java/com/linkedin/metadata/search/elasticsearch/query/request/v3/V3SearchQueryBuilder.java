@@ -13,13 +13,13 @@ import com.linkedin.metadata.config.search.custom.FieldConfiguration;
 import com.linkedin.metadata.config.search.custom.QueryConfiguration;
 import com.linkedin.metadata.config.search.custom.SearchFields;
 import com.linkedin.metadata.models.EntitySpec;
+import com.linkedin.metadata.models.StructuredPropertyUtils;
 import com.linkedin.metadata.models.registry.EntityRegistry;
 import com.linkedin.metadata.query.SearchFlags;
 import com.linkedin.metadata.search.elasticsearch.index.entity.v3.V3SearchFields;
 import com.linkedin.metadata.search.elasticsearch.query.request.CustomizedQueryHandler;
 import com.linkedin.metadata.search.elasticsearch.query.request.SearchFieldConfig;
 import com.linkedin.metadata.search.elasticsearch.query.request.SearchQueryBuilder;
-import com.linkedin.metadata.search.elasticsearch.query.request.V3StructuredPropertySearchCatalog;
 import com.linkedin.metadata.search.elasticsearch.query.request.v3.understanding.IdentityQueryStrategy;
 import com.linkedin.metadata.search.elasticsearch.query.request.v3.understanding.QueryIntent;
 import com.linkedin.metadata.search.elasticsearch.query.request.v3.understanding.QueryStrategy;
@@ -1013,7 +1013,7 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
         .forEach(
             cfg -> {
               fieldBoosts.merge(cfg.fieldName(), cfg.boost(), Math::max);
-              if (isStructuredPropertyQueryField(cfg)) {
+              if (StructuredPropertyUtils.isStructuredPropertyField(cfg.fieldName())) {
                 lenient[0] = true;
               }
             });
@@ -1742,11 +1742,14 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
   // build the mapping
   private final Map<List<String>, Map<String, List<String>>> fullTextFieldsByEntities =
       new ConcurrentHashMap<>();
+  private final StructuredPropertySearchCatalog structuredPropertySearchCatalog;
 
   public V3SearchQueryBuilder(
       @Nonnull final SearchConfiguration searchConfiguration,
       @Nullable final CustomSearchConfiguration customSearchConfiguration) {
     super(searchConfiguration, customSearchConfiguration);
+    this.structuredPropertySearchCatalog =
+        new StructuredPropertySearchCatalog(searchConfiguration.getStructuredProperties());
   }
 
   /**
@@ -1819,7 +1822,7 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
                 root -> destinations.computeIfAbsent(root, k -> new HashSet<>()).add(name)));
     final Set<SearchFieldConfig> result =
         fields.stream()
-            .filter(field -> !isStructuredPropertyQueryField(field))
+            .filter(field -> !StructuredPropertyUtils.isStructuredPropertyField(field.fieldName()))
             .filter(
                 field ->
                     field.fieldName().startsWith(V3SearchFields.path(""))
@@ -1897,8 +1900,8 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
               boost * STEMMED_FACTOR));
     }
     final float factor = partialConfiguration.getFactor();
-    for (V3StructuredPropertySearchCatalog.IndexedProperty property :
-        V3StructuredPropertySearchCatalog.indexed(QUERY_CONTEXT.get(), entitySpecs)) {
+    for (StructuredPropertySearchCatalog.IndexedProperty property :
+        structuredPropertySearchCatalog.indexed(QUERY_CONTEXT.get(), entitySpecs)) {
       fields.add(
           propertyField(
               property.fieldPath(),
@@ -1936,10 +1939,6 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
         .build();
   }
 
-  private static boolean isStructuredPropertyQueryField(@Nonnull SearchFieldConfig field) {
-    return field.fieldName().startsWith(V3SearchFields.STRUCTURED_PROPERTIES + ".");
-  }
-
   /**
    * Properties the configuration keeps. {@code structuredProperties} names every opted-in property.
    * A full path, with or without {@code .text} or {@code .stemmed}, names one. Added and replaced
@@ -1949,7 +1948,9 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
   private static Set<SearchFieldConfig> selectStructuredProperties(
       @Nonnull Set<SearchFieldConfig> fields, @Nonnull SearchFields searchFields) {
     final List<SearchFieldConfig> properties =
-        fields.stream().filter(V3SearchQueryBuilder::isStructuredPropertyQueryField).toList();
+        fields.stream()
+            .filter(field -> StructuredPropertyUtils.isStructuredPropertyField(field.fieldName()))
+            .toList();
     if (!searchFields.getReplace().isEmpty()) {
       return properties.stream()
           .filter(field -> namesSelect(searchFields.getReplace(), field))
@@ -2012,7 +2013,9 @@ public class V3SearchQueryBuilder extends SearchQueryBuilder {
     Map<Boolean, List<SearchFieldConfig>> groups = new LinkedHashMap<>();
     for (SearchFieldConfig field : fields) {
       groups
-          .computeIfAbsent(isStructuredPropertyQueryField(field), key -> new ArrayList<>())
+          .computeIfAbsent(
+              StructuredPropertyUtils.isStructuredPropertyField(field.fieldName()),
+              key -> new ArrayList<>())
           .add(field);
     }
     for (Map.Entry<Boolean, List<SearchFieldConfig>> group : groups.entrySet()) {

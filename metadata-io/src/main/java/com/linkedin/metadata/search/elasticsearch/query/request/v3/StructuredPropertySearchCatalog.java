@@ -1,4 +1,4 @@
-package com.linkedin.metadata.search.elasticsearch.query.request;
+package com.linkedin.metadata.search.elasticsearch.query.request.v3;
 
 import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTIES_ASPECT_NAME;
 import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME;
@@ -14,6 +14,7 @@ import com.linkedin.data.DataMap;
 import com.linkedin.datahub.DataHubSearchConfig;
 import com.linkedin.entity.Aspect;
 import com.linkedin.metadata.aspect.CachingAspectRetriever;
+import com.linkedin.metadata.config.search.StructuredPropertyQueryConfiguration;
 import com.linkedin.metadata.entity.SearchRetriever;
 import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.models.LogicalValueType;
@@ -32,29 +33,36 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Structured properties Search V3 full-text reads. Active property URNs come from search, which
  * excludes soft-deleted entities. Definitions come from the cached entity client.
  */
-public final class V3StructuredPropertySearchCatalog {
+@Slf4j
+public final class StructuredPropertySearchCatalog {
 
-  private static final int PAGE_SIZE = 500;
-  // Match cache.client.entityClient.entityAspectTTLSeconds.structuredProperty.propertyDefinition.
-  private static final int CACHE_TTL_SECONDS = 300;
-  private static final float DEFAULT_TEXT_WEIGHT = 0.8f;
-  private static final float STEMMED_FACTOR = 0.5f;
-  private static final String STEMMED = "stemmed";
-  private static final Cache<SearchRetriever, List<IndexedProperty>> CACHE =
-      CacheBuilder.newBuilder()
-          .maximumSize(100)
-          .expireAfterWrite(CACHE_TTL_SECONDS, TimeUnit.SECONDS)
-          .build();
+  private static final ConcurrentHashMap<
+          StructuredPropertyQueryConfiguration, Cache<SearchRetriever, List<IndexedProperty>>>
+      CACHES = new ConcurrentHashMap<>();
 
-  private V3StructuredPropertySearchCatalog() {}
+  private final StructuredPropertyQueryConfiguration config;
+  private final Cache<SearchRetriever, List<IndexedProperty>> cache;
+
+  public StructuredPropertySearchCatalog(@Nonnull StructuredPropertyQueryConfiguration config) {
+    if (config.getPageSize() < 1
+        || config.getMaxProperties() < 1
+        || config.getCacheTtlSeconds() < 1) {
+      throw new IllegalArgumentException(
+          "elasticsearch.search.structuredProperties requires a positive page size, property limit, and cache TTL");
+    }
+    this.config = config;
+    this.cache = CACHES.computeIfAbsent(config, StructuredPropertySearchCatalog::newCache);
+  }
 
   /**
    * Opted-in properties that apply to at least one of {@code entitySpecs}. A property mapped on
@@ -62,7 +70,7 @@ public final class V3StructuredPropertySearchCatalog {
    * others.
    */
   @Nonnull
-  public static List<IndexedProperty> indexed(
+  public List<IndexedProperty> indexed(
       @Nullable OperationContext opContext, @Nonnull Collection<EntitySpec> entitySpecs) {
     if (opContext == null
         || entitySpecs.stream()
@@ -71,12 +79,21 @@ public final class V3StructuredPropertySearchCatalog {
     }
     SearchRetriever searchRetriever = opContext.getRetrieverContext().getSearchRetriever();
     List<IndexedProperty> all =
-        CACHE.asMap().computeIfAbsent(searchRetriever, ignored -> load(opContext, searchRetriever));
+        cache.asMap().computeIfAbsent(searchRetriever, ignored -> load(opContext, searchRetriever));
     return all.stream().filter(property -> property.appliesTo(entitySpecs)).toList();
   }
 
   @Nonnull
-  private static List<IndexedProperty> load(
+  private static Cache<SearchRetriever, List<IndexedProperty>> newCache(
+      @Nonnull StructuredPropertyQueryConfiguration config) {
+    return CacheBuilder.newBuilder()
+        .maximumSize(config.getMaxProperties())
+        .expireAfterWrite(config.getCacheTtlSeconds(), TimeUnit.SECONDS)
+        .build();
+  }
+
+  @Nonnull
+  private List<IndexedProperty> load(
       @Nonnull OperationContext opContext, @Nonnull SearchRetriever searchRetriever) {
     SearchFlags flags = new SearchFlags(new DataMap(SearchRetriever.RETRIEVER_SEARCH_FLAGS.data()));
     SortCriterion urnSort = new SortCriterion().setField("urn").setOrder(SortOrder.ASCENDING);
@@ -85,39 +102,58 @@ public final class V3StructuredPropertySearchCatalog {
 
     List<IndexedProperty> properties = new ArrayList<>();
     String scrollId = null;
-    do {
+    while (properties.size() < config.getMaxProperties()) {
+      int pageSize = Math.min(config.getPageSize(), config.getMaxProperties() - properties.size());
       ScrollResult page =
           searchRetriever.scroll(
               List.of(STRUCTURED_PROPERTY_ENTITY_NAME),
               null,
               scrollId,
-              PAGE_SIZE,
+              pageSize,
               List.of(urnSort),
               flags);
       if (page.getEntities() == null || page.getEntities().isEmpty()) {
         break;
       }
       Set<Urn> urns = new LinkedHashSet<>();
-      page.getEntities().stream().map(SearchEntity::getEntity).forEach(urns::add);
+      for (SearchEntity entity : page.getEntities()) {
+        if (urns.size() >= pageSize) {
+          break;
+        }
+        urns.add(entity.getEntity());
+      }
       Map<Urn, Map<String, Aspect>> aspects =
           aspectRetriever.getLatestAspectObjects(
               opContext, urns, Set.of(STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME));
       for (Urn urn : urns) {
-        Aspect definitionAspect =
-            aspects.getOrDefault(urn, Map.of()).get(STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME);
-        if (definitionAspect == null) {
-          continue;
+        if (properties.size() >= config.getMaxProperties()) {
+          break;
         }
-        indexedProperty(urn, new StructuredPropertyDefinition(new DataMap(definitionAspect.data())))
-            .ifPresent(properties::add);
+        // One unreadable definition must not fail the query. A thrown load is not cached, so the
+        // failure would repeat on every search.
+        try {
+          Aspect definitionAspect =
+              aspects.getOrDefault(urn, Map.of()).get(STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME);
+          if (definitionAspect == null || definitionAspect.data() == null) {
+            continue;
+          }
+          indexedProperty(
+                  urn, new StructuredPropertyDefinition(new DataMap(definitionAspect.data())))
+              .ifPresent(properties::add);
+        } catch (RuntimeException e) {
+          log.warn("Skipping structured property {} with an unreadable definition", urn, e);
+        }
       }
       scrollId = page.getScrollId();
-    } while (scrollId != null);
+      if (scrollId == null) {
+        break;
+      }
+    }
     return List.copyOf(properties);
   }
 
   @Nonnull
-  private static Optional<IndexedProperty> indexedProperty(
+  private Optional<IndexedProperty> indexedProperty(
       @Nonnull Urn propertyUrn, @Nonnull StructuredPropertyDefinition definition) {
     if (!definition.hasSearchConfiguration()
         || definition.getEntityTypes() == null
@@ -143,18 +179,19 @@ public final class V3StructuredPropertySearchCatalog {
             stemmedWeight(config, textWeight)));
   }
 
-  private static float textWeight(@Nonnull DataHubSearchConfig config) {
+  private float textWeight(@Nonnull DataHubSearchConfig config) {
     if (config.data().containsKey("boostScore")) {
       return config.getBoostScore().floatValue();
     }
-    return DEFAULT_TEXT_WEIGHT;
+    return this.config.getDefaultTextWeight();
   }
 
-  private static float stemmedWeight(@Nonnull DataHubSearchConfig config, final float textWeight) {
-    if (config.hasSubfieldBoostScores() && config.getSubfieldBoostScores().containsKey(STEMMED)) {
-      return config.getSubfieldBoostScores().get(STEMMED).floatValue();
+  private float stemmedWeight(@Nonnull DataHubSearchConfig config, final float textWeight) {
+    if (config.hasSubfieldBoostScores()
+        && config.getSubfieldBoostScores().containsKey(V3SearchFields.STEMMED)) {
+      return config.getSubfieldBoostScores().get(V3SearchFields.STEMMED).floatValue();
     }
-    return textWeight * STEMMED_FACTOR;
+    return textWeight * this.config.getStemmedFactor();
   }
 
   /**
