@@ -8,6 +8,12 @@ import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
+import com.linkedin.common.Status;
+import com.linkedin.common.UrnArray;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.template.DoubleMap;
+import com.linkedin.datahub.DataHubSearchConfig;
 import com.linkedin.metadata.config.search.CustomConfiguration;
 import com.linkedin.metadata.config.search.custom.CustomSearchConfiguration;
 import com.linkedin.metadata.config.search.custom.FieldConfiguration;
@@ -16,9 +22,12 @@ import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.search.elasticsearch.index.entity.v3.V3SearchFields;
 import com.linkedin.metadata.search.elasticsearch.query.request.v3.V3SearchQueryBuilder;
 import com.linkedin.metadata.search.query.request.SearchQueryBuilderTest;
+import com.linkedin.structured.StructuredPropertyDefinition;
+import com.linkedin.test.metadata.aspect.MockAspectRetriever;
 import io.datahubproject.metadata.context.OperationContext;
 import io.datahubproject.test.metadata.context.TestOperationContexts;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -75,7 +84,6 @@ public class V3SearchQueryBuilderTest {
                 "_search.entityName.text",
                 "_search.description.text",
                 "_search.columns.text",
-                "_search.structuredProperties.text",
                 "_search.other.text")),
         text.toString());
     assertTrue(text.stream().allMatch(field -> field.endsWith(".text")), text.toString());
@@ -136,13 +144,7 @@ public class V3SearchQueryBuilderTest {
     assertTrue(
         weights.get("_search.description.text") > weights.get("_search.other.text"),
         weights.toString());
-    // Structured property values weigh what DataHub Cloud's query gives them, between the two
-    assertTrue(
-        weights.get("_search.description.text") > weights.get("_search.structuredProperties.text"),
-        weights.toString());
-    assertTrue(
-        weights.get("_search.structuredProperties.text") > weights.get("_search.other.text"),
-        weights.toString());
+    assertFalse(weights.containsKey("_search.structuredProperties.text"), weights.toString());
   }
 
   /**
@@ -213,11 +215,134 @@ public class V3SearchQueryBuilderTest {
   }
 
   @Test
+  public void testStructuredPropertyFieldsUseDefinitionWeights() {
+    OperationContext context = propertyContext();
+    List<EntitySpec> dataset =
+        List.of(context.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME));
+    V3SearchQueryBuilder queryBuilder = builder(null);
+    QueryBuilder query = queryBuilder.buildQuery(context, dataset, "orders table", true);
+    assertFalse(query.toString().contains("_search.structuredProperties"), query.toString());
+    assertFalse(query.toString().contains("customFullTextSearchFields"), query.toString());
+
+    Map<String, Float> text = analyzerFields(query, V3SearchFields.TEXT_SEARCH_ANALYZER);
+    Map<String, Float> stemmed = analyzerFields(query, V3SearchFields.STEMMED_SEARCH_ANALYZER);
+    float description = text.get("_search.description.text");
+    assertEquals(text.get("structuredProperties.retentionPolicy.text") / description, 0.8f, 0.001f);
+    assertEquals(
+        stemmed.get("structuredProperties.retentionPolicy.stemmed") / description, 0.4f, 0.001f);
+    assertEquals(text.get("structuredProperties.weightedNote.text") / description, 3.0f, 0.001f);
+    assertEquals(
+        stemmed.get("structuredProperties.weightedNote.stemmed") / description, 1.25f, 0.001f);
+    assertFalse(text.containsKey("structuredProperties.hiddenLabel.text"), text.toString());
+
+    SimpleQueryStringBuilder propertyClause =
+        find(query, SimpleQueryStringBuilder.class).stream()
+            .filter(
+                clause -> clause.fields().containsKey("structuredProperties.retentionPolicy.text"))
+            .findFirst()
+            .orElseThrow();
+    assertTrue(propertyClause.lenient(), propertyClause.toString());
+    assertFalse(
+        propertyClause.fields().containsKey("_search.entityName.text"), propertyClause.toString());
+
+    Set<String> singleWord =
+        only(find(
+                queryBuilder.buildQuery(context, dataset, "orders", true, true),
+                MultiMatchQueryBuilder.class))
+            .fields()
+            .keySet();
+    assertTrue(
+        singleWord.stream().noneMatch(field -> field.startsWith("structuredProperties.")),
+        singleWord.toString());
+    assertFalse(singleWord.contains("customFullTextSearchFields"), singleWord.toString());
+
+    Set<String> severalWords =
+        only(find(
+                queryBuilder.buildQuery(context, dataset, "orders table", true, true),
+                MultiMatchQueryBuilder.class))
+            .fields()
+            .keySet();
+    assertTrue(
+        severalWords.containsAll(
+            Set.of(
+                "structuredProperties.retentionPolicy.text",
+                "structuredProperties.weightedNote.stemmed")),
+        severalWords.toString());
+    assertFalse(
+        severalWords.contains("structuredProperties.hiddenLabel.text"), severalWords.toString());
+    assertTrue(
+        severalWords.stream().anyMatch(field -> !field.startsWith("_search.")),
+        severalWords.toString());
+  }
+
+  @Test
+  public void testFieldConfigurationSelectsStructuredPropertiesByPath() {
+    OperationContext context = propertyContext();
+    List<EntitySpec> dataset =
+        List.of(context.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME));
+    V3SearchQueryBuilder configured =
+        builder(
+            CustomSearchConfiguration.builder()
+                .fieldConfigurations(
+                    Map.of(
+                        "addHidden",
+                        searchFields(
+                            SearchFields.builder()
+                                .add(List.of("structuredProperties.hiddenLabel"))
+                                .build()),
+                        "dropProperties",
+                        searchFields(
+                            SearchFields.builder().remove(List.of("structuredProperties")).build()),
+                        "onlyRetention",
+                        searchFields(
+                            SearchFields.builder()
+                                .replace(List.of("structuredProperties.retentionPolicy"))
+                                .build())))
+                .build());
+
+    Set<String> added =
+        analyzerFields(
+                configured.buildQuery(
+                    context.withSearchFlags(flags -> flags.setFieldConfiguration("addHidden")),
+                    dataset,
+                    "orders table",
+                    true),
+                V3SearchFields.TEXT_SEARCH_ANALYZER)
+            .keySet();
+    assertTrue(added.contains("structuredProperties.hiddenLabel.text"), added.toString());
+
+    Set<String> dropped =
+        analyzerFields(
+                configured.buildQuery(
+                    context.withSearchFlags(flags -> flags.setFieldConfiguration("dropProperties")),
+                    dataset,
+                    "orders table",
+                    true),
+                V3SearchFields.TEXT_SEARCH_ANALYZER)
+            .keySet();
+    assertTrue(
+        dropped.stream().noneMatch(field -> field.startsWith("structuredProperties.")),
+        dropped.toString());
+
+    Set<String> replaced =
+        analyzerFields(
+                configured.buildQuery(
+                    context.withSearchFlags(flags -> flags.setFieldConfiguration("onlyRetention")),
+                    dataset,
+                    "orders table",
+                    true),
+                V3SearchFields.TEXT_SEARCH_ANALYZER)
+            .keySet();
+    assertTrue(replaced.contains("structuredProperties.retentionPolicy.text"), replaced.toString());
+    assertFalse(replaced.contains("_search.entityName.text"), replaced.toString());
+    assertFalse(replaced.contains("structuredProperties.weightedNote.text"), replaced.toString());
+  }
+
+  @Test
   public void testLightQueryReadsSharedFields() {
     V3SearchQueryBuilder builder = builder(null);
 
-    // A single name searches the shared fields that name the entity and, as DataHub Cloud's light
-    // query does, the structured property values
+    // A single name searches only the shared fields that name the entity
     Set<String> name =
         only(find(
                 builder.buildQuery(OP_CONTEXT, DATASET, "orders", true, true),
@@ -230,9 +355,8 @@ public class V3SearchQueryBuilderTest {
             "_search.entityName.text",
             "_search.entityName.stemmed",
             "_search.qualifiedName.text",
-            "_search.qualifiedName.stemmed",
-            "_search.structuredProperties.text",
-            "_search.structuredProperties.stemmed"));
+            "_search.qualifiedName.stemmed"));
+    assertFalse(name.contains("customFullTextSearchFields"), name.toString());
 
     // Several words search every shared field
     Set<String> words =
@@ -244,7 +368,9 @@ public class V3SearchQueryBuilderTest {
     assertTrue(
         words.containsAll(Set.of("_search.description.text", "_search.columns.stemmed")),
         words.toString());
-    assertTrue(words.stream().allMatch(field -> field.startsWith("_search.")), words.toString());
+    assertTrue(
+        words.stream().noneMatch(field -> field.startsWith("structuredProperties.")),
+        words.toString());
 
     // An identifier the escaping breaks up is matched whole on the names
     List<MultiMatchQueryBuilder> identity =
@@ -406,6 +532,51 @@ public class V3SearchQueryBuilderTest {
         find(plain, SimpleQueryStringBuilder.class).stream()
             .anyMatch(simple -> V3SearchFields.TEXT_SEARCH_ANALYZER.equals(simple.analyzer())),
         plain.toString());
+  }
+
+  private static Map<String, Float> analyzerFields(QueryBuilder query, String analyzer) {
+    Map<String, Float> fields = new HashMap<>();
+    find(query, SimpleQueryStringBuilder.class).stream()
+        .filter(clause -> clause.value().contains("~") && analyzer.equals(clause.analyzer()))
+        .forEach(clause -> fields.putAll(clause.fields()));
+    return fields;
+  }
+
+  private static OperationContext propertyContext() {
+    Urn retention = UrnUtils.getUrn("urn:li:structuredProperty:retentionPolicy");
+    Urn weighted = UrnUtils.getUrn("urn:li:structuredProperty:weightedNote");
+    Urn hidden = UrnUtils.getUrn("urn:li:structuredProperty:hiddenLabel");
+    UrnArray datasets = new UrnArray(UrnUtils.getUrn("urn:li:entityType:datahub.dataset"));
+    StructuredPropertyDefinition retentionPolicy =
+        new StructuredPropertyDefinition()
+            .setQualifiedName("retentionPolicy")
+            .setValueType(UrnUtils.getUrn("urn:li:dataType:datahub.string"))
+            .setEntityTypes(datasets)
+            .setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(true));
+    StructuredPropertyDefinition weightedNote =
+        new StructuredPropertyDefinition()
+            .setQualifiedName("weightedNote")
+            .setValueType(UrnUtils.getUrn("urn:li:dataType:datahub.string"))
+            .setEntityTypes(new UrnArray(datasets))
+            .setSearchConfiguration(
+                new DataHubSearchConfig()
+                    .setQueryByDefault(true)
+                    .setBoostScore(3.0)
+                    .setSubfieldBoostScores(new DoubleMap(Map.of("stemmed", 1.25d))));
+    StructuredPropertyDefinition hiddenLabel =
+        new StructuredPropertyDefinition()
+            .setQualifiedName("hiddenLabel")
+            .setValueType(UrnUtils.getUrn("urn:li:dataType:datahub.string"))
+            .setEntityTypes(new UrnArray(datasets))
+            .setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(false));
+    MockAspectRetriever retriever =
+        new MockAspectRetriever(
+            Map.of(
+                retention, List.of(retentionPolicy, new Status().setRemoved(false)),
+                weighted, List.of(weightedNote, new Status().setRemoved(false)),
+                hidden, List.of(hiddenLabel, new Status().setRemoved(false))));
+    retriever.setEntityRegistry(TestOperationContexts.defaultEntityRegistry());
+    return TestOperationContexts.systemContextNoSearchAuthorization(retriever);
   }
 
   private static V3SearchQueryBuilder builder(CustomSearchConfiguration customConfiguration) {

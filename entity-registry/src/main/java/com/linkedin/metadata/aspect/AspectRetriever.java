@@ -7,8 +7,11 @@ import com.linkedin.common.urn.Urn;
 import com.linkedin.entity.Aspect;
 import com.linkedin.metadata.models.registry.EmptyEntityRegistry;
 import com.linkedin.metadata.models.registry.EntityRegistry;
+import com.linkedin.structured.StructuredPropertyDefinition;
+import com.linkedin.util.Pair;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -133,4 +136,15 @@ public interface AspectRetriever {
 
   @Nonnull
   EntityRegistry getEntityRegistry();
+
+  /**
+   * Active structured property definitions, excluding those whose status is removed. The default
+   * returns nothing: a retriever that can list entities overrides this. Search V3 uses the result
+   * to choose which root property fields to query, and does not store it on a request handler.
+   */
+  @Nonnull
+  default List<Pair<Urn, StructuredPropertyDefinition>> listStructuredPropertyDefinitions(
+      @Nonnull OperationFingerprint context) {
+    return List.of();
+  }
 }

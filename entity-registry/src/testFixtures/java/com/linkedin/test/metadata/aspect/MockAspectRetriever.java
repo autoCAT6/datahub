@@ -1,5 +1,9 @@
 package com.linkedin.test.metadata.aspect;
 
+import static com.linkedin.metadata.Constants.STATUS_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_ENTITY_NAME;
+
 import com.datahub.context.OperationFingerprint;
 import com.linkedin.common.AuditStamp;
 import com.linkedin.common.Status;
@@ -18,6 +22,7 @@ import com.linkedin.test.metadata.aspect.batch.TestSystemAspect;
 import com.linkedin.util.Pair;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -100,6 +105,30 @@ public class MockAspectRetriever implements CachingAspectRetriever, AspectRetrie
         .filter(data::containsKey)
         .map(urn -> Pair.of(urn, data.get(urn)))
         .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
+  }
+
+  @Nonnull
+  @Override
+  public List<Pair<Urn, StructuredPropertyDefinition>> listStructuredPropertyDefinitions(
+      @Nonnull OperationFingerprint context) {
+    List<Pair<Urn, StructuredPropertyDefinition>> definitions = new ArrayList<>();
+    for (Map.Entry<Urn, Map<String, Aspect>> entry : data.entrySet()) {
+      if (!STRUCTURED_PROPERTY_ENTITY_NAME.equals(entry.getKey().getEntityType())) {
+        continue;
+      }
+      Aspect status = entry.getValue().get(STATUS_ASPECT_NAME);
+      if (status != null && Boolean.TRUE.equals(new Status(status.data()).isRemoved())) {
+        continue;
+      }
+      Aspect definition = entry.getValue().get(STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME);
+      if (definition == null) {
+        continue;
+      }
+      definitions.add(
+          Pair.of(
+              entry.getKey(), new StructuredPropertyDefinition(new DataMap(definition.data()))));
+    }
+    return definitions;
   }
 
   @Nonnull

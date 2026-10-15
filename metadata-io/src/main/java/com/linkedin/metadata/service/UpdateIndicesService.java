@@ -16,6 +16,7 @@ import com.linkedin.metadata.entity.ebean.batch.MCLItemImpl;
 import com.linkedin.metadata.models.AspectSpec;
 import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.search.elasticsearch.ElasticSearchService;
+import com.linkedin.metadata.search.elasticsearch.query.request.V3StructuredPropertySearchCatalog;
 import com.linkedin.metadata.search.elasticsearch.update.BulkTransferException;
 import com.linkedin.metadata.search.elasticsearch.update.ESBulkProcessor;
 import com.linkedin.metadata.search.elasticsearch.update.ESWriteDAO;
@@ -240,6 +241,9 @@ public class UpdateIndicesService implements SearchIndicesService {
       @Nonnull AspectSpec aspectSpec,
       @Nonnull Object newValue,
       @Nullable Object oldValue) {
+    if (STRUCTURED_PROPERTY_ENTITY_NAME.equals(entitySpec.getName())) {
+      V3StructuredPropertySearchCatalog.invalidate();
+    }
     for (UpdateIndicesStrategy strategy : updateStrategies) {
       if (strategy.isEnabled()) {
         strategy.updateIndexMappings(opContext, urn, entitySpec, aspectSpec, newValue, oldValue);
