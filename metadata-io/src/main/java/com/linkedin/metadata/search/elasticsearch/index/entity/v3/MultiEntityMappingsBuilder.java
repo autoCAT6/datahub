@@ -1,6 +1,7 @@
 package com.linkedin.metadata.search.elasticsearch.index.entity.v3;
 
 import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTIES_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_ENTITY_NAME;
 import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_MAPPING_FIELD;
 import static com.linkedin.metadata.models.StructuredPropertyUtils.getEntityTypeId;
 import static com.linkedin.metadata.models.StructuredPropertyUtils.getLogicalValueType;
@@ -449,6 +450,13 @@ public class MultiEntityMappingsBuilder implements MappingsBuilder {
     }
 
     applyGeneratedRootSystemMappings(combinedMappings);
+    if (entitySpecs.stream()
+        .anyMatch(entitySpec -> STRUCTURED_PROPERTY_ENTITY_NAME.equals(entitySpec.getName()))) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> properties = (Map<String, Object>) combinedMappings.get(PROPERTIES);
+      properties.put(
+          StructuredPropertySearchMetadata.FIELD, StructuredPropertySearchMetadata.mapping());
+    }
 
     applyMappingContributors(combinedMappings, searchGroup);
 

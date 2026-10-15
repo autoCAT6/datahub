@@ -118,6 +118,55 @@ public class MultiEntityMappingsBuilderTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
+  public void testStructuredPropertyQueryMetadataMappingIsScopedToItsIndexGroup()
+      throws IOException {
+    when(mockV3Config.getMappingConfig()).thenReturn("search_entity_mapping_config.yaml");
+    OperationContext registryContext = TestOperationContexts.systemContextNoSearchAuthorization();
+    Map<String, Map<String, Object>> propertiesByIndex =
+        new MultiEntityMappingsBuilder(mockConfig)
+            .getIndexMappings(registryContext).stream()
+                .collect(
+                    Collectors.toMap(
+                        IndexMapping::getIndexName,
+                        mapping -> getProperties(mapping.getMappings())));
+
+    EntitySpec structuredPropertySpec =
+        registryContext.getEntityRegistry().getEntitySpec(STRUCTURED_PROPERTY_ENTITY_NAME);
+    String structuredPropertyIndex =
+        registryContext
+            .getSearchContext()
+            .getIndexConvention()
+            .getEntityIndexNameV3(registryContext, V3IndexKeys.resolve(structuredPropertySpec));
+    Map<String, Object> metadata =
+        (Map<String, Object>)
+            propertiesByIndex
+                .get(structuredPropertyIndex)
+                .get(StructuredPropertySearchMetadata.FIELD);
+    assertEquals(metadata.get("type"), "object");
+    assertEquals(metadata.get("dynamic"), false);
+    Map<String, Object> metadataProperties = (Map<String, Object>) metadata.get("properties");
+    assertEquals(((Map<String, Object>) metadataProperties.get("enabled")).get("type"), "boolean");
+    assertEquals(
+        ((Map<String, Object>) metadataProperties.get("fieldPath")).get("type"), "keyword");
+    assertEquals(
+        ((Map<String, Object>) metadataProperties.get("queryByDefault")).get("type"), "boolean");
+    assertEquals(
+        ((Map<String, Object>) metadataProperties.get("textWeight")).get("type"), "double");
+    assertEquals(
+        ((Map<String, Object>) metadataProperties.get("stemmedWeight")).get("type"), "double");
+
+    EntitySpec datasetSpec = registryContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME);
+    String datasetIndex =
+        registryContext
+            .getSearchContext()
+            .getIndexConvention()
+            .getEntityIndexNameV3(registryContext, V3IndexKeys.resolve(datasetSpec));
+    assertFalse(
+        propertiesByIndex.get(datasetIndex).containsKey(StructuredPropertySearchMetadata.FIELD));
+  }
+
+  @Test
   public void testGetIndexMappingsMergesMappingContributorRootFields() throws IOException {
     V3MappingContributor contributor =
         () -> Collections.singletonMap("_ext", FieldTypeMapper.getMappingsForKeyword());

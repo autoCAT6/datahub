@@ -49,6 +49,7 @@ import com.linkedin.common.urn.UrnUtils;
 import com.linkedin.dashboard.DashboardInfo;
 import com.linkedin.data.template.RecordTemplate;
 import com.linkedin.data.template.StringArray;
+import com.linkedin.data.template.StringMap;
 import com.linkedin.datahub.DataHubSearchConfig;
 import com.linkedin.dataset.DatasetProperties;
 import com.linkedin.dataset.EditableDatasetProperties;
@@ -73,12 +74,14 @@ import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.models.registry.EntityRegistry;
 import com.linkedin.metadata.query.AutoCompleteEntity;
 import com.linkedin.metadata.query.AutoCompleteResult;
+import com.linkedin.metadata.query.SearchFlags;
 import com.linkedin.metadata.query.filter.Filter;
 import com.linkedin.metadata.query.filter.SortCriterion;
 import com.linkedin.metadata.query.filter.SortOrder;
 import com.linkedin.metadata.search.AggregationMetadata;
 import com.linkedin.metadata.search.FilterValue;
 import com.linkedin.metadata.search.MatchedField;
+import com.linkedin.metadata.search.ScrollResult;
 import com.linkedin.metadata.search.SearchEntity;
 import com.linkedin.metadata.search.SearchEntityArray;
 import com.linkedin.metadata.search.SearchResult;
@@ -87,6 +90,7 @@ import com.linkedin.metadata.search.elasticsearch.SearchWriteAccess;
 import com.linkedin.metadata.search.elasticsearch.index.MappingsBuilder;
 import com.linkedin.metadata.search.elasticsearch.index.SettingsBuilder;
 import com.linkedin.metadata.search.elasticsearch.index.entity.v3.MultiEntityMappingsBuilder;
+import com.linkedin.metadata.search.elasticsearch.index.entity.v3.StructuredPropertySearchMetadata;
 import com.linkedin.metadata.search.elasticsearch.indexbuilder.ESIndexBuilder;
 import com.linkedin.metadata.search.elasticsearch.indexbuilder.ReindexConfig;
 import com.linkedin.metadata.search.elasticsearch.query.ESBrowseDAO;
@@ -312,7 +316,14 @@ public abstract class KeywordSearchV3TestBase extends AbstractTestNGSpringContex
             .cachingAspectRetriever(
                 TestOperationContexts.emptyActiveUsersAspectRetriever(() -> entityRegistry))
             .graphRetriever(GraphRetriever.EMPTY)
-            .searchRetriever(SearchRetriever.EMPTY)
+            .searchRetriever(
+                structuredPropertySearchRetriever(
+                    Map.of(
+                        RETENTION_POLICY, retentionPolicy,
+                        STEWARD_NOTE, stewardNote,
+                        INTERNAL_CODE, internalCode,
+                        HIDDEN_LABEL, hiddenLabel,
+                        LEGACY_EXCLUDED, legacyExcluded)))
             .build();
     opContext =
         TestOperationContexts.systemContextNoSearchAuthorization(
@@ -592,6 +603,47 @@ public abstract class KeywordSearchV3TestBase extends AbstractTestNGSpringContex
                         .setLastModified(new ChangeAuditStamps()))),
             false);
     syncAfterWrite(getBulkProcessor());
+  }
+
+  private static SearchRetriever structuredPropertySearchRetriever(
+      Map<Urn, StructuredPropertyDefinition> definitions) {
+    return new SearchRetriever() {
+      @Override
+      public ScrollResult scroll(
+          List<String> entities,
+          Filter filters,
+          String scrollId,
+          Integer count,
+          List<SortCriterion> sortCriteria,
+          SearchFlags searchFlags) {
+        SearchEntityArray results = new SearchEntityArray();
+        if (scrollId == null) {
+          ObjectMapper mapper = new ObjectMapper();
+          definitions.forEach(
+              (urn, definition) -> {
+                StringMap extraFields = new StringMap();
+                extraFields.put(
+                    StructuredPropertySearchMetadata.FIELD,
+                    StructuredPropertySearchMetadata.project(urn, definition).toString());
+                try {
+                  extraFields.put(
+                      "entityTypes",
+                      mapper.writeValueAsString(
+                          definition.getEntityTypes().stream()
+                              .map(Urn::toString)
+                              .collect(Collectors.toList())));
+                } catch (IOException e) {
+                  throw new RuntimeException(e);
+                }
+                results.add(new SearchEntity().setEntity(urn).setExtraFields(extraFields));
+              });
+        }
+        return new ScrollResult()
+            .setEntities(results)
+            .setNumEntities(results.size())
+            .setPageSize(results.size());
+      }
+    };
   }
 
   @AfterClass(alwaysRun = true)

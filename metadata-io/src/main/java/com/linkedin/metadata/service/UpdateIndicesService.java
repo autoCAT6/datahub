@@ -116,6 +116,10 @@ public class UpdateIndicesService implements SearchIndicesService {
         strategy.processBatch(opContext, groupedEvents, structuredPropertiesHookEnabled);
       }
     }
+    if (groupedEvents.keySet().stream()
+        .anyMatch(urn -> STRUCTURED_PROPERTY_ENTITY_NAME.equals(urn.getEntityType()))) {
+      V3StructuredPropertySearchCatalog.invalidate();
+    }
 
     // Record throttle writes after all strategies have processed, so no strategy's
     // recordWrite can race with another strategy's shouldThrottle on the same event.
@@ -241,9 +245,6 @@ public class UpdateIndicesService implements SearchIndicesService {
       @Nonnull AspectSpec aspectSpec,
       @Nonnull Object newValue,
       @Nullable Object oldValue) {
-    if (STRUCTURED_PROPERTY_ENTITY_NAME.equals(entitySpec.getName())) {
-      V3StructuredPropertySearchCatalog.invalidate();
-    }
     for (UpdateIndicesStrategy strategy : updateStrategies) {
       if (strategy.isEnabled()) {
         strategy.updateIndexMappings(opContext, urn, entitySpec, aspectSpec, newValue, oldValue);

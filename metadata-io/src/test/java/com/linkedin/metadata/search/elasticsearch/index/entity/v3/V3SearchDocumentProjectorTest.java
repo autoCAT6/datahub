@@ -16,15 +16,19 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.linkedin.common.AuditStamp;
+import com.linkedin.common.UrnArray;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.template.DoubleMap;
 import com.linkedin.data.template.RecordTemplate;
+import com.linkedin.datahub.DataHubSearchConfig;
 import com.linkedin.events.metadata.ChangeType;
 import com.linkedin.metadata.aspect.batch.MCLItem;
 import com.linkedin.metadata.models.AspectSpec;
 import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.search.transformer.SearchDocumentTransformer;
 import com.linkedin.mxe.SystemMetadata;
+import com.linkedin.structured.StructuredPropertyDefinition;
 import io.datahubproject.metadata.context.OperationContext;
 import io.datahubproject.test.metadata.context.TestOperationContexts;
 import java.net.URISyntaxException;
@@ -131,6 +135,137 @@ public class V3SearchDocumentProjectorTest {
     assertTrue(projectedAspect.rootOnly());
     assertEquals(document.get("structuredProperties.my_property").asText(), "value");
     assertFalse(document.has(MappingConstants.ASPECTS_FIELD_NAME));
+  }
+
+  @Test
+  public void testProjectsStructuredPropertyQueryMetadataAtRootOnly() throws Exception {
+    Urn propertyUrn = UrnUtils.getUrn("urn:li:structuredProperty:my.property");
+    StructuredPropertyDefinition definition =
+        definition()
+            .setSearchConfiguration(
+                new DataHubSearchConfig()
+                    .setQueryByDefault(true)
+                    .setBoostScore(3.0)
+                    .setSubfieldBoostScores(new DoubleMap(Map.of("stemmed", 1.25d))));
+    ObjectNode transformed = JsonNodeFactory.instance.objectNode();
+    transformed.put("urn", propertyUrn.toString());
+    when(event.getUrn()).thenReturn(propertyUrn);
+    when(event.getRecordTemplate()).thenReturn(definition);
+    when(event.getPreviousRecordTemplate()).thenReturn(null);
+    when(aspectSpec.getName()).thenReturn("propertyDefinition");
+    when(searchDocumentTransformer.transformAspect(
+            eq(opContext),
+            eq(propertyUrn),
+            eq(definition),
+            eq(aspectSpec),
+            eq(false),
+            eq(auditStamp)))
+        .thenReturn(Optional.of(transformed));
+
+    V3SearchDocumentProjector.ProjectedAspect projection =
+        projector.projectAspect(opContext, event).orElseThrow();
+
+    ObjectNode metadata =
+        (ObjectNode) projection.rootFields().get(StructuredPropertySearchMetadata.FIELD);
+    assertTrue(metadata.get("enabled").asBoolean());
+    assertEquals(metadata.get("fieldPath").asText(), "structuredProperties.my_property");
+    assertTrue(metadata.get("queryByDefault").asBoolean());
+    assertEquals(metadata.get("textWeight").asDouble(), 3.0);
+    assertEquals(metadata.get("stemmedWeight").asDouble(), 1.25);
+    assertFalse(projection.aspectFields().has(StructuredPropertySearchMetadata.FIELD));
+  }
+
+  @Test
+  public void testRemovingSearchConfigurationReplacesMetadataWithDisabledProjection()
+      throws Exception {
+    Urn propertyUrn = UrnUtils.getUrn("urn:li:structuredProperty:my.property");
+    StructuredPropertyDefinition current = definition();
+    StructuredPropertyDefinition previous =
+        definition().setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(true));
+    ObjectNode currentDocument = JsonNodeFactory.instance.objectNode();
+    currentDocument.put("urn", propertyUrn.toString());
+    ObjectNode previousDocument = currentDocument.deepCopy();
+    when(event.getUrn()).thenReturn(propertyUrn);
+    when(event.getRecordTemplate()).thenReturn(current);
+    when(event.getPreviousRecordTemplate()).thenReturn(previous);
+    when(aspectSpec.getName()).thenReturn("propertyDefinition");
+    when(searchDocumentTransformer.transformAspect(
+            eq(opContext), eq(propertyUrn), eq(current), eq(aspectSpec), eq(false), eq(auditStamp)))
+        .thenReturn(Optional.of(currentDocument));
+    when(searchDocumentTransformer.transformAspect(
+            eq(opContext),
+            eq(propertyUrn),
+            eq(previous),
+            eq(aspectSpec),
+            eq(false),
+            eq(auditStamp)))
+        .thenReturn(Optional.of(previousDocument));
+
+    ObjectNode metadata =
+        (ObjectNode)
+            projector
+                .projectAspect(opContext, event)
+                .orElseThrow()
+                .rootFields()
+                .get(StructuredPropertySearchMetadata.FIELD);
+
+    assertFalse(metadata.get("enabled").asBoolean());
+    assertTrue(metadata.get("fieldPath").isNull());
+    assertTrue(metadata.get("queryByDefault").isNull());
+    assertTrue(metadata.get("textWeight").isNull());
+    assertTrue(metadata.get("stemmedWeight").isNull());
+  }
+
+  @Test
+  public void testDeletingDefinitionClearsStructuredPropertyQueryMetadata() throws Exception {
+    Urn propertyUrn = UrnUtils.getUrn("urn:li:structuredProperty:my.property");
+    StructuredPropertyDefinition definition =
+        definition().setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(true));
+    ObjectNode transformed = JsonNodeFactory.instance.objectNode();
+    transformed.put("urn", propertyUrn.toString());
+    when(event.getUrn()).thenReturn(propertyUrn);
+    when(event.getRecordTemplate()).thenReturn(definition);
+    when(event.getPreviousRecordTemplate()).thenReturn(null);
+    when(event.getChangeType()).thenReturn(ChangeType.DELETE);
+    when(aspectSpec.getName()).thenReturn("propertyDefinition");
+    when(searchDocumentTransformer.transformAspect(
+            eq(opContext),
+            eq(propertyUrn),
+            eq(definition),
+            eq(aspectSpec),
+            eq(true),
+            eq(auditStamp)))
+        .thenReturn(Optional.of(transformed));
+
+    assertTrue(
+        projector
+            .projectAspect(opContext, event)
+            .orElseThrow()
+            .rootFields()
+            .get(StructuredPropertySearchMetadata.FIELD)
+            .isNull());
+  }
+
+  @Test
+  public void testStructuredPropertyQueryMetadataEligibilityAndDefaultWeights() {
+    Urn propertyUrn = UrnUtils.getUrn("urn:li:structuredProperty:my.property");
+    ObjectNode defaults =
+        StructuredPropertySearchMetadata.project(
+            propertyUrn,
+            definition()
+                .setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(false)));
+    assertTrue(defaults.get("enabled").asBoolean());
+    assertEquals(defaults.get("textWeight").asDouble(), 0.8, 0.0001);
+    assertEquals(defaults.get("stemmedWeight").asDouble(), 0.4, 0.0001);
+
+    ObjectNode ineligible =
+        StructuredPropertySearchMetadata.project(
+            propertyUrn,
+            definition()
+                .setValueType(UrnUtils.getUrn("urn:li:dataType:datahub.number"))
+                .setSearchConfiguration(new DataHubSearchConfig().setQueryByDefault(true)));
+    assertFalse(ineligible.get("enabled").asBoolean());
+    assertEquals(ineligible.size(), 1);
   }
 
   @Test
@@ -255,5 +390,12 @@ public class V3SearchDocumentProjectorTest {
         (ObjectNode) document.get(MappingConstants.ASPECTS_FIELD_NAME).get("semanticContent");
     assertTrue(aspectNode.has("embeddings"));
     assertEquals(aspectNode.get("skipReason").asText(), "EMPTY_TEXT");
+  }
+
+  private static StructuredPropertyDefinition definition() {
+    return new StructuredPropertyDefinition()
+        .setQualifiedName("my.property")
+        .setValueType(UrnUtils.getUrn("urn:li:dataType:datahub.string"))
+        .setEntityTypes(new UrnArray(UrnUtils.getUrn("urn:li:entityType:datahub.dataset")));
   }
 }
