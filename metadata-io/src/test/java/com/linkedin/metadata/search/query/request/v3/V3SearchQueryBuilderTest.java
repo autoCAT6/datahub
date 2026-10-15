@@ -7,28 +7,30 @@ import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.datahub.context.OperationFingerprint;
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
 import com.linkedin.common.UrnArray;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.common.urn.UrnUtils;
 import com.linkedin.data.template.DoubleMap;
-import com.linkedin.data.template.StringMap;
 import com.linkedin.datahub.DataHubSearchConfig;
+import com.linkedin.entity.Aspect;
+import com.linkedin.metadata.aspect.CachingAspectRetriever;
 import com.linkedin.metadata.aspect.GraphRetriever;
+import com.linkedin.metadata.aspect.SystemAspect;
 import com.linkedin.metadata.config.search.CustomConfiguration;
 import com.linkedin.metadata.config.search.custom.CustomSearchConfiguration;
 import com.linkedin.metadata.config.search.custom.FieldConfiguration;
 import com.linkedin.metadata.config.search.custom.SearchFields;
 import com.linkedin.metadata.entity.SearchRetriever;
 import com.linkedin.metadata.models.EntitySpec;
+import com.linkedin.metadata.models.registry.EntityRegistry;
 import com.linkedin.metadata.query.SearchFlags;
 import com.linkedin.metadata.query.filter.Filter;
 import com.linkedin.metadata.query.filter.SortCriterion;
 import com.linkedin.metadata.search.ScrollResult;
 import com.linkedin.metadata.search.SearchEntity;
 import com.linkedin.metadata.search.SearchEntityArray;
-import com.linkedin.metadata.search.elasticsearch.index.entity.v3.StructuredPropertySearchMetadata;
 import com.linkedin.metadata.search.elasticsearch.index.entity.v3.V3SearchFields;
 import com.linkedin.metadata.search.elasticsearch.query.request.v3.V3SearchQueryBuilder;
 import com.linkedin.metadata.search.query.request.SearchQueryBuilderTest;
@@ -592,21 +594,59 @@ public class V3SearchQueryBuilderTest {
     RetrieverContext retrieverContext =
         RetrieverContext.builder()
             .aspectRetriever(retriever)
-            .cachingAspectRetriever(
-                TestOperationContexts.emptyActiveUsersAspectRetriever(retriever::getEntityRegistry))
+            .cachingAspectRetriever(definitionsWithActiveUsers(retriever))
             .graphRetriever(GraphRetriever.EMPTY)
             .searchRetriever(
-                structuredPropertySearchRetriever(
-                    Map.of(
-                        retention, retentionPolicy,
-                        weighted, weightedNote,
-                        hidden, hiddenLabel)))
+                structuredPropertySearchRetriever(List.of(retention, weighted, hidden)))
             .build();
     return TestOperationContexts.systemContextNoSearchAuthorization(retrieverContext);
   }
 
-  private static SearchRetriever structuredPropertySearchRetriever(
-      Map<Urn, StructuredPropertyDefinition> definitions) {
+  private static CachingAspectRetriever definitionsWithActiveUsers(
+      MockAspectRetriever definitions) {
+    CachingAspectRetriever activeUsers =
+        TestOperationContexts.emptyActiveUsersAspectRetriever(definitions::getEntityRegistry);
+    return new CachingAspectRetriever() {
+      @Nonnull
+      @Override
+      public Map<Urn, Map<String, Aspect>> getLatestAspectObjects(
+          @Nonnull OperationFingerprint context, Set<Urn> urns, Set<String> aspectNames) {
+        Map<Urn, Map<String, Aspect>> found =
+            new HashMap<>(definitions.getLatestAspectObjects(context, urns, aspectNames));
+        Set<Urn> missing = new HashSet<>();
+        for (Urn urn : urns) {
+          if (!found.containsKey(urn)) {
+            missing.add(urn);
+          }
+        }
+        if (!missing.isEmpty()) {
+          found.putAll(activeUsers.getLatestAspectObjects(context, missing, aspectNames));
+        }
+        return found;
+      }
+
+      @Nonnull
+      @Override
+      public Map<Urn, Map<String, SystemAspect>> getLatestSystemAspects(
+          @Nonnull OperationFingerprint context, Map<Urn, Set<String>> urnAspectNames) {
+        return definitions.getLatestSystemAspects(context, urnAspectNames);
+      }
+
+      @Nonnull
+      @Override
+      public Map<Urn, Boolean> entityExists(@Nonnull OperationFingerprint context, Set<Urn> urns) {
+        return definitions.entityExists(context, urns);
+      }
+
+      @Nonnull
+      @Override
+      public EntityRegistry getEntityRegistry() {
+        return definitions.getEntityRegistry();
+      }
+    };
+  }
+
+  private static SearchRetriever structuredPropertySearchRetriever(List<Urn> propertyUrns) {
     return new SearchRetriever() {
       @Override
       public ScrollResult scroll(
@@ -618,25 +658,7 @@ public class V3SearchQueryBuilderTest {
           @Nullable SearchFlags searchFlags) {
         SearchEntityArray results = new SearchEntityArray();
         if (scrollId == null) {
-          ObjectMapper mapper = new ObjectMapper();
-          definitions.forEach(
-              (urn, definition) -> {
-                StringMap extraFields = new StringMap();
-                extraFields.put(
-                    StructuredPropertySearchMetadata.FIELD,
-                    StructuredPropertySearchMetadata.project(urn, definition).toString());
-                try {
-                  extraFields.put(
-                      "entityTypes",
-                      mapper.writeValueAsString(
-                          definition.getEntityTypes().stream()
-                              .map(Urn::toString)
-                              .collect(Collectors.toList())));
-                } catch (Exception e) {
-                  throw new RuntimeException(e);
-                }
-                results.add(new SearchEntity().setEntity(urn).setExtraFields(extraFields));
-              });
+          propertyUrns.forEach(urn -> results.add(new SearchEntity().setEntity(urn)));
         }
         return new ScrollResult()
             .setEntities(results)

@@ -3,7 +3,7 @@ package com.linkedin.metadata.search.elasticsearch.index.entity.v3;
 import static com.linkedin.metadata.models.StructuredPropertyUtils.entityTypeMatches;
 import static com.linkedin.metadata.models.StructuredPropertyUtils.getLogicalValueType;
 import static com.linkedin.metadata.models.StructuredPropertyUtils.toElasticsearchFieldName;
-import static com.linkedin.metadata.search.elasticsearch.index.entity.v2.V2LegacySettingsBuilder.FIELDS;
+import static com.linkedin.metadata.search.utils.ESUtils.FIELDS;
 import static com.linkedin.metadata.search.utils.ESUtils.TYPE;
 
 import com.linkedin.common.urn.Urn;

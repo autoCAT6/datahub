@@ -49,12 +49,14 @@ import com.linkedin.common.urn.UrnUtils;
 import com.linkedin.dashboard.DashboardInfo;
 import com.linkedin.data.template.RecordTemplate;
 import com.linkedin.data.template.StringArray;
-import com.linkedin.data.template.StringMap;
 import com.linkedin.datahub.DataHubSearchConfig;
 import com.linkedin.dataset.DatasetProperties;
 import com.linkedin.dataset.EditableDatasetProperties;
+import com.linkedin.entity.Aspect;
 import com.linkedin.events.metadata.ChangeType;
+import com.linkedin.metadata.aspect.CachingAspectRetriever;
 import com.linkedin.metadata.aspect.GraphRetriever;
+import com.linkedin.metadata.aspect.SystemAspect;
 import com.linkedin.metadata.aspect.batch.MCLItem;
 import com.linkedin.metadata.browse.BrowseResult;
 import com.linkedin.metadata.browse.BrowseResultEntity;
@@ -90,7 +92,6 @@ import com.linkedin.metadata.search.elasticsearch.SearchWriteAccess;
 import com.linkedin.metadata.search.elasticsearch.index.MappingsBuilder;
 import com.linkedin.metadata.search.elasticsearch.index.SettingsBuilder;
 import com.linkedin.metadata.search.elasticsearch.index.entity.v3.MultiEntityMappingsBuilder;
-import com.linkedin.metadata.search.elasticsearch.index.entity.v3.StructuredPropertySearchMetadata;
 import com.linkedin.metadata.search.elasticsearch.indexbuilder.ESIndexBuilder;
 import com.linkedin.metadata.search.elasticsearch.indexbuilder.ReindexConfig;
 import com.linkedin.metadata.search.elasticsearch.query.ESBrowseDAO;
@@ -131,6 +132,8 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -313,17 +316,16 @@ public abstract class KeywordSearchV3TestBase extends AbstractTestNGSpringContex
     RetrieverContext retrieverContext =
         RetrieverContext.builder()
             .aspectRetriever(aspectRetriever)
-            .cachingAspectRetriever(
-                TestOperationContexts.emptyActiveUsersAspectRetriever(() -> entityRegistry))
+            .cachingAspectRetriever(definitionsWithActiveUsers(aspectRetriever))
             .graphRetriever(GraphRetriever.EMPTY)
             .searchRetriever(
                 structuredPropertySearchRetriever(
-                    Map.of(
-                        RETENTION_POLICY, retentionPolicy,
-                        STEWARD_NOTE, stewardNote,
-                        INTERNAL_CODE, internalCode,
-                        HIDDEN_LABEL, hiddenLabel,
-                        LEGACY_EXCLUDED, legacyExcluded)))
+                    List.of(
+                        RETENTION_POLICY,
+                        STEWARD_NOTE,
+                        INTERNAL_CODE,
+                        HIDDEN_LABEL,
+                        LEGACY_EXCLUDED)))
             .build();
     opContext =
         TestOperationContexts.systemContextNoSearchAuthorization(
@@ -605,8 +607,51 @@ public abstract class KeywordSearchV3TestBase extends AbstractTestNGSpringContex
     syncAfterWrite(getBulkProcessor());
   }
 
-  private static SearchRetriever structuredPropertySearchRetriever(
-      Map<Urn, StructuredPropertyDefinition> definitions) {
+  private static CachingAspectRetriever definitionsWithActiveUsers(
+      MockAspectRetriever definitions) {
+    CachingAspectRetriever activeUsers =
+        TestOperationContexts.emptyActiveUsersAspectRetriever(definitions::getEntityRegistry);
+    return new CachingAspectRetriever() {
+      @Nonnull
+      @Override
+      public Map<Urn, Map<String, Aspect>> getLatestAspectObjects(
+          @Nonnull OperationFingerprint context, Set<Urn> urns, Set<String> aspectNames) {
+        Map<Urn, Map<String, Aspect>> found =
+            new HashMap<>(definitions.getLatestAspectObjects(context, urns, aspectNames));
+        Set<Urn> missing = new HashSet<>();
+        for (Urn urn : urns) {
+          if (!found.containsKey(urn)) {
+            missing.add(urn);
+          }
+        }
+        if (!missing.isEmpty()) {
+          found.putAll(activeUsers.getLatestAspectObjects(context, missing, aspectNames));
+        }
+        return found;
+      }
+
+      @Nonnull
+      @Override
+      public Map<Urn, Map<String, SystemAspect>> getLatestSystemAspects(
+          @Nonnull OperationFingerprint context, Map<Urn, Set<String>> urnAspectNames) {
+        return definitions.getLatestSystemAspects(context, urnAspectNames);
+      }
+
+      @Nonnull
+      @Override
+      public Map<Urn, Boolean> entityExists(@Nonnull OperationFingerprint context, Set<Urn> urns) {
+        return definitions.entityExists(context, urns);
+      }
+
+      @Nonnull
+      @Override
+      public EntityRegistry getEntityRegistry() {
+        return definitions.getEntityRegistry();
+      }
+    };
+  }
+
+  private static SearchRetriever structuredPropertySearchRetriever(List<Urn> propertyUrns) {
     return new SearchRetriever() {
       @Override
       public ScrollResult scroll(
@@ -618,25 +663,7 @@ public abstract class KeywordSearchV3TestBase extends AbstractTestNGSpringContex
           SearchFlags searchFlags) {
         SearchEntityArray results = new SearchEntityArray();
         if (scrollId == null) {
-          ObjectMapper mapper = new ObjectMapper();
-          definitions.forEach(
-              (urn, definition) -> {
-                StringMap extraFields = new StringMap();
-                extraFields.put(
-                    StructuredPropertySearchMetadata.FIELD,
-                    StructuredPropertySearchMetadata.project(urn, definition).toString());
-                try {
-                  extraFields.put(
-                      "entityTypes",
-                      mapper.writeValueAsString(
-                          definition.getEntityTypes().stream()
-                              .map(Urn::toString)
-                              .collect(Collectors.toList())));
-                } catch (IOException e) {
-                  throw new RuntimeException(e);
-                }
-                results.add(new SearchEntity().setEntity(urn).setExtraFields(extraFields));
-              });
+          propertyUrns.forEach(urn -> results.add(new SearchEntity().setEntity(urn)));
         }
         return new ScrollResult()
             .setEntities(results)

@@ -1,7 +1,6 @@
 package com.linkedin.metadata.search.elasticsearch.index.entity.v3;
 
 import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTIES_ASPECT_NAME;
-import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME;
 
 import com.datahub.util.RecordUtils;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -15,7 +14,6 @@ import com.linkedin.metadata.models.AspectSpec;
 import com.linkedin.metadata.models.EntitySpec;
 import com.linkedin.metadata.search.transformer.SearchDocumentTransformer;
 import com.linkedin.mxe.SystemMetadata;
-import com.linkedin.structured.StructuredPropertyDefinition;
 import io.datahubproject.metadata.context.OperationContext;
 import java.util.Iterator;
 import java.util.Map;
@@ -115,10 +113,6 @@ public class V3SearchDocumentProjector {
                               event.getEntitySpec(),
                               aspectSpec,
                               event.getAuditStamp()));
-      transformed.ifPresent(
-          document ->
-              projectStructuredPropertySearchMetadata(
-                  document, event.getUrn(), aspectSpec, event.getRecordTemplate(), isDelete));
       return transformed;
     } catch (Exception e) {
       throw propagate(
@@ -139,10 +133,6 @@ public class V3SearchDocumentProjector {
       Optional<ObjectNode> transformed =
           searchDocumentTransformer.transformAspect(
               opContext, urn, previousAspect, aspectSpec, false, event.getAuditStamp());
-      transformed.ifPresent(
-          document ->
-              projectStructuredPropertySearchMetadata(
-                  document, urn, aspectSpec, previousAspect, false));
       return transformed;
     } catch (Exception e) {
       throw propagate(
@@ -161,9 +151,6 @@ public class V3SearchDocumentProjector {
 
     final ObjectNode aspectFields = projectedFields.deepCopy();
     aspectFields.remove(URN_FIELD);
-    if (STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME.equals(aspectName)) {
-      aspectFields.remove(StructuredPropertySearchMetadata.FIELD);
-    }
     addSystemMetadata(opContext, aspectFields, systemMetadata);
 
     if (SEMANTIC_CONTENT_ASPECT_NAME.equals(aspectName)) {
@@ -174,24 +161,6 @@ public class V3SearchDocumentProjector {
     }
 
     return new ProjectedAspect(aspectName, rootFields, aspectFields, rootOnly);
-  }
-
-  private static void projectStructuredPropertySearchMetadata(
-      @Nonnull ObjectNode document,
-      @Nonnull Urn urn,
-      @Nonnull AspectSpec aspectSpec,
-      @Nullable RecordTemplate aspect,
-      final boolean forDelete) {
-    if (!STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME.equals(aspectSpec.getName())) {
-      return;
-    }
-    if (forDelete || !(aspect instanceof StructuredPropertyDefinition definition)) {
-      document.set(StructuredPropertySearchMetadata.FIELD, JsonNodeFactory.instance.nullNode());
-      return;
-    }
-    document.set(
-        StructuredPropertySearchMetadata.FIELD,
-        StructuredPropertySearchMetadata.project(urn, definition));
   }
 
   private static void addSystemMetadata(
