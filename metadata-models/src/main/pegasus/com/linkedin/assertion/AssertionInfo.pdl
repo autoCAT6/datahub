@@ -10,7 +10,7 @@ import com.linkedin.common.Urn
  */
 @Aspect = {
   "name": "assertionInfo",
-  "schemaVersion": 6
+  "schemaVersion": 7
 }
 record AssertionInfo includes CustomProperties, ExternalReference {
     /**
@@ -89,7 +89,15 @@ record AssertionInfo includes CustomProperties, ExternalReference {
       "fieldName": "assertionDescription",
       "fieldType": "TEXT",
       "hasValuesFieldName": "hasAssertionDescription",
-      "sanitizeRichText": true
+      "sanitizeRichText": true,
+      "v3": {
+        "searchLabel": "description",
+        "mappings": [
+          { "type": "KEYWORD", "index": false, "docValues": false },
+          { "subfield": "text", "type": "TEXT" },
+          { "subfield": "stemmed", "type": "STEMMED" }
+        ]
+      }
   }
     description: optional string
 
